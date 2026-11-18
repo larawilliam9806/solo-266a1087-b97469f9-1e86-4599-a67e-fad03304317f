@@ -144,6 +144,29 @@ class StateStore:
         with self.transaction() as conn:
             conn.execute("UPDATE files SET status='deleted' WHERE file_id=?", (file_id,))
 
+    def relocate_file(self, file_id: str, new_date: str, new_path: str,
+                      user_ids: Iterable[str]) -> None:
+        """Atomically re-register an active file under another date partition
+        and add the new date to the erasure index of every user in the file.
+
+        The old ``(user, date)`` entries are kept on purpose: they are a
+        conservative superset, so an erasure accepted at any moment still
+        finds every date the user ever touched. The file keeps its
+        ``file_id``, therefore pending erasure work items pointing at it stay
+        valid across the move.
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE files SET date=?, path=? WHERE file_id=? AND status='active'",
+                (new_date, new_path, file_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"file {file_id} vanished during relocation")
+            conn.executemany(
+                "INSERT OR IGNORE INTO user_dates(user_id, date) VALUES (?,?)",
+                [(u, new_date) for u in user_ids],
+            )
+
     # -------------------------------------------------------- erasure tasks
 
     def accept_task(self, task_id: str, user_id: str) -> None:

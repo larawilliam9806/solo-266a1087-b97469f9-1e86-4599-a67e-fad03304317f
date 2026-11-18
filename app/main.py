@@ -13,7 +13,14 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from .config import Config
-from .core import ErasureService, NoDataError, RestrictedError
+from .core import (
+    ErasureService,
+    FileStateError,
+    NoDataError,
+    RestrictedError,
+    UncorrectableFileError,
+    UnknownFileError,
+)
 from .schemas import ErasureRequest
 from .storage import SCHEMA
 
@@ -114,7 +121,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         yield
         service.shutdown()
 
-    app = FastAPI(title="Click Lake Erasure API", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Click Lake Erasure API", version="1.1.0", lifespan=lifespan)
     app.state.service = service
 
     # ------------------------------------------------------------- ingest
@@ -169,6 +176,22 @@ def create_app(config: Config | None = None) -> FastAPI:
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="clicks-{date}.csv"'},
         )
+
+    # ------------------------------------------------------- date correction
+
+    @app.post(
+        "/files/{file_id}/correct-date",
+        summary="Move a mis-partitioned file to the UTC date of its clicks",
+    )
+    def correct_file_date(file_id: str):
+        try:
+            return service.correct_file_date(file_id)
+        except UnknownFileError as exc:
+            raise HTTPException(404, str(exc))
+        except UncorrectableFileError as exc:
+            raise HTTPException(422, str(exc))
+        except FileStateError as exc:
+            raise HTTPException(409, str(exc))
 
     # ------------------------------------------------------------- erasure
 

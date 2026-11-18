@@ -33,6 +33,31 @@ class NoDataError(Exception):
         super().__init__(f"no data for date {date}")
 
 
+class UnknownFileError(Exception):
+    def __init__(self, file_id: str):
+        self.file_id = file_id
+        super().__init__(f"unknown file {file_id}")
+
+
+class UncorrectableFileError(Exception):
+    """The file's contents do not allow a date correction (client error)."""
+
+
+class FileStateError(Exception):
+    """The file cannot be corrected right now because of its state or because
+    of an erasure in progress (conflict)."""
+
+
+class CorrectionRestrictedError(FileStateError):
+    def __init__(self, dates: set[str]):
+        self.dates = sorted(dates)
+        super().__init__(
+            "cannot correct the file while date(s) "
+            + ", ".join(self.dates)
+            + " are restricted by an erasure in progress"
+        )
+
+
 class ErasureService:
     """Core of the click lake: ingest, download and GDPR-style erasure.
 
@@ -58,8 +83,8 @@ class ErasureService:
         self._date_locks: dict[str, threading.RLock] = {}
         self._date_locks_guard = threading.Lock()
         self.worker = ErasureWorker(self)
-        # test hook invoked inside the commit lock right before an upload is filtered
-        self.hooks = SimpleNamespace(before_write=None)
+        # test hooks invoked inside the commit lock
+        self.hooks = SimpleNamespace(before_write=None, before_correct_commit=None)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -153,6 +178,110 @@ class ErasureService:
                 raise NoDataError(date)
             tables = [storage.read_table(self.config.data_dir, f["path"]) for f in files]
         return pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+
+    # ---------------------------------------------------- date correction
+
+    def correct_file_date(self, file_id: str) -> dict:
+        """Move a mis-partitioned active file to the UTC date of its clicks.
+
+        Only a file whose rows all fall on a single UTC date different from
+        its registered date can be corrected; anything else is rejected and the
+        file keeps serving from its registered date.
+
+        Atomicity and interleaving
+        --------------------------
+        * The new part file is written durably first, the state DB is updated
+          in a single transaction (file row + erasure index), and only then
+          is the old file removed. A failure before the DB commit leaves the
+          old partition fully in place; a crash after it leaves a stale copy
+          that start-up reconciliation removes. At no point do two dates
+          serve the same rows, and no row is ever lost.
+        * Validation and the commit run under ``commit_lock`` — the same lock
+          erasure acceptance takes — while holding both dates' locks. If an
+          erasure is accepted first, the source date is restricted and the
+          correction is refused; if the correction commits first, the
+          erasure snapshot sees the new ``(user, date)`` index entries and
+          tracks the file at its new location. A file containing a blocked
+          user can therefore never surface from a new partition.
+        * The date locks also serialize the commit and the old-file removal
+          against in-progress downloads of both dates, so a download that
+          already started always finishes with a consistent view.
+        """
+        info = self.store.get_file(file_id)
+        if info is None:
+            raise UnknownFileError(file_id)
+        if info["status"] != "active":
+            raise FileStateError(
+                f"file {file_id} is not active (status={info['status']})"
+            )
+        source = info["date"]
+        path = info["path"]
+        try:
+            table = storage.read_table(self.config.data_dir, path)
+        except FileNotFoundError:
+            # an erasure rewrite replaced the file between the lookup and the
+            # read; the committed state is consistent, so this is retryable
+            raise FileStateError(
+                f"file {file_id} changed while correcting it; retry the request"
+            ) from None
+        if table.num_rows == 0:
+            raise UncorrectableFileError(f"file {file_id} has no rows")
+        days = {ts.date().isoformat() for ts in table.column("ts").to_pylist()}
+        if len(days) > 1:
+            raise UncorrectableFileError(
+                f"file {file_id} spans multiple UTC dates {sorted(days)};"
+                " refusing to move it"
+            )
+        target = next(iter(days))
+        if target == source:
+            raise UncorrectableFileError(
+                f"file {file_id} is already registered under its clicks' date {source}"
+            )
+        users = set(table.column("user_id").to_pylist())
+
+        first, second = sorted((source, target))
+        with self.date_lock(first), self.date_lock(second):
+            with self.commit_lock:
+                if self.hooks.before_correct_commit is not None:
+                    self.hooks.before_correct_commit()
+                cur = self.store.get_file(file_id)
+                if (
+                    cur is None
+                    or cur["status"] != "active"
+                    or cur["date"] != source
+                    or cur["path"] != path
+                ):
+                    raise FileStateError(
+                        f"file {file_id} changed while correcting it; retry the request"
+                    )
+                restricted = {source, target} & self.store.restricted_dates()
+                if restricted:
+                    raise CorrectionRestrictedError(restricted)
+                leaked = users & self.blocked_users
+                if leaked:
+                    raise FileStateError(
+                        f"file {file_id} contains user(s) with an erasure task:"
+                        f" {sorted(leaked)}"
+                    )
+                _, new_path = storage.write_table_atomic(
+                    self.config.data_dir, target, table, file_id=file_id
+                )
+                self.store.relocate_file(file_id, target, new_path, users)
+            try:
+                storage.delete_file(self.config.data_dir, path)
+            except OSError as exc:
+                # the DB already points at the new location; the stale copy is
+                # an orphan that start-up reconciliation removes
+                log.warning(
+                    "could not remove old part file %s after correction: %s", path, exc
+                )
+        return {
+            "file_id": file_id,
+            "old_date": source,
+            "new_date": target,
+            "rows": table.num_rows,
+            "users": len(users),
+        }
 
     # -------------------------------------------------------------- erasure
 
